@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trình ký điện tử</title>
+<style>
+:root{--ink:#14213d;--mut:#5b6678;--line:#d5dbe4;--bg:#eef1f5;--card:#fff;--seal:#b3261e;--ok:#1f7a4d;--warn:#b26a00;
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--ink)}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);font-size:15px;line-height:1.5}
+h1,h2,h3{font-family:Georgia,"Times New Roman",serif;margin:0 0 .5rem}
+button{font:inherit;cursor:pointer;border:1px solid var(--ink);background:var(--ink);color:#fff;padding:.45rem .9rem;border-radius:4px}
+button.ghost{background:#fff;color:var(--ink)}button.red{background:var(--seal);border-color:var(--seal)}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #7aa2ff;outline-offset:1px}
+input,select,textarea{font:inherit;padding:.45rem .6rem;border:1px solid var(--line);border-radius:4px;width:100%;background:#fff}
+label{display:block;margin:.6rem 0 .2rem;color:var(--mut);font-size:13px}
+.hide{display:none!important}
+#login{max-width:360px;margin:12vh auto;background:var(--card);padding:2rem;border-top:4px solid var(--seal)}
+#login button{width:100%;margin-top:1rem}
+.err{color:var(--seal);margin-top:.6rem;min-height:1.2em}
+header{background:var(--ink);color:#fff;padding:.7rem 1.2rem;display:flex;align-items:center;gap:1rem}
+header h1{margin:0;font-size:1.15rem;flex:1}
+header .who{font-size:13px;opacity:.9}
+.bell{position:relative}.bell button{background:transparent;border-color:#ffffff66}
+#notes{position:absolute;right:0;top:2.4rem;width:320px;background:#fff;color:var(--ink);border:1px solid var(--line);z-index:5;max-height:300px;overflow:auto}
+#notes div{padding:.6rem .8rem;border-bottom:1px solid var(--line);font-size:13px}
+.layout{display:grid;grid-template-columns:200px 1fr;min-height:calc(100vh - 52px)}
+nav{background:#fff;border-right:1px solid var(--line);padding:1rem .6rem}
+nav button{display:block;width:100%;text-align:left;background:transparent;color:var(--ink);border:0;border-left:3px solid transparent;border-radius:0;margin-bottom:2px}
+nav button.on{border-left-color:var(--seal);background:var(--bg);font-weight:600}
+main{padding:1.4rem;max-width:1000px}
+table{width:100%;border-collapse:collapse;background:var(--card)}
+th,td{text-align:left;padding:.55rem .7rem;border-bottom:1px solid var(--line);font-size:14px;vertical-align:top}
+th{color:var(--mut);font-weight:600;background:#f7f9fb}tr.row{cursor:pointer}tr.row:hover{background:#f3f6fb}
+.chip{display:inline-block;padding:.1rem .55rem;border-radius:3px;border:1.5px solid;font-size:12.5px;font-weight:600}
+.s-draft,.s-cancelled{color:var(--mut)}.s-pending{color:var(--warn)}.s-signed{color:var(--ok)}.s-rejected{color:var(--seal)}
+.bar{display:flex;gap:.6rem;align-items:center;margin-bottom:1rem}.bar h2{flex:1;margin:0}
+.panel{background:var(--card);padding:1.2rem;border:1px solid var(--line);margin-bottom:1rem}
+dialog{border:0;padding:1.4rem;max-width:620px;width:92%;box-shadow:0 8px 40px #0004}dialog::backdrop{background:#14213d88}
+.steps{list-style:none;padding:0;margin:1rem 0}
+.steps li{display:flex;gap:.9rem;padding:.5rem 0;border-left:2px solid var(--line);margin-left:22px;padding-left:1.4rem;position:relative}
+.seal{position:absolute;left:-23px;top:2px;width:44px;height:44px;border-radius:50%;display:grid;place-items:center;
+  font-size:11px;font-weight:700;background:#fff;border:2px dashed var(--line);color:var(--mut)}
+.seal.signed{border:3px double var(--seal);color:var(--seal);transform:rotate(-8deg)}
+.seal.rejected{border:3px solid var(--mut);color:var(--mut);background:#eee}
+.seal.cur{border:2px solid var(--warn);color:var(--warn)}
+.hash{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all;color:var(--mut)}
+.ok{color:var(--ok);font-weight:600}.bad{color:var(--seal);font-weight:600}
+iframe{width:100%;height:420px;border:1px solid var(--line);margin-top:.6rem}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:.8rem}
+.actions{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.8rem}
+@media(max-width:700px){.layout{grid-template-columns:1fr}nav{display:flex;overflow:auto;border-right:0}.row2{grid-template-columns:1fr}}
+@media(prefers-reduced-motion:no-preference){.seal.signed{transition:transform .3s}}
+</style>
+</head>
+<body>
+<section id="login">
+  <h1>Trình ký điện tử</h1>
+  <p style="color:var(--mut);margin-top:0">Đăng nhập để tạo, theo dõi và ký duyệt văn bản.</p>
+  <label for="lu">Tên đăng nhập</label><input id="lu" autocomplete="username">
+  <label for="lp">Mật khẩu</label><input id="lp" type="password" autocomplete="current-password">
+  <button id="lbtn">Đăng nhập</button><div class="err" id="lerr"></div>
+</section>
+
+<div id="app" class="hide">
+  <header><h1>Trình ký điện tử</h1><span class="who" id="who"></span>
+    <div class="bell"><button id="bellbtn" class="ghost" style="color:#fff" aria-label="Thông báo">Thông báo <b id="bn"></b></button><div id="notes" class="hide"></div></div>
+    <button class="ghost" id="logout">Đăng xuất</button></header>
+  <div class="layout"><nav id="nav"></nav><main id="main"></main></div>
+</div>
+
+<dialog id="dlg"></dialog>
+
+<script>
+let token = sessionStorage.getItem("tk"), me = null, MGR = [], TPL = {}, view = "";
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const ST = {draft:"Nháp",pending:"Đang chờ ký",signed:"Đã ký",rejected:"Từ chối",cancelled:"Hủy"};
+const ROLE = {user:"Nhân viên",manager:"Người duyệt",admin:"Quản trị"};
+const chip = s => `<span class="chip s-${s}">${ST[s]}</span>`;
+
+async function api(path, o = {}) {
+  o.headers = {...(o.headers||{}), Authorization: "Bearer " + token};
+  if (o.json) { o.headers["Content-Type"] = "application/json"; o.body = JSON.stringify(o.json); }
+  const r = await fetch("/api" + path, o);
+  if (r.status === 401 && path !== "/login") { logout(); throw new Error("Phiên đã hết hạn"); }
+  if (!r.ok) { let m = r.statusText; try { m = (await r.json()).detail || m } catch {} throw new Error(m); }
+  return r;
+}
+const j = async (p, o) => (await api(p, o)).json();
+const toast = m => alert(m);
+
+// ---------- đăng nhập
+$("#lbtn").onclick = async () => {
+  try {
+    const r = await fetch("/api/login", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({username: $("#lu").value, password: $("#lp").value})});
+    const d = await r.json(); if (!r.ok) throw new Error(d.detail);
+    token = d.token; sessionStorage.setItem("tk", token); start();
+  } catch (e) { $("#lerr").textContent = e.message; }
+};
+$("#lp").onkeydown = e => e.key === "Enter" && $("#lbtn").click();
+function logout() { sessionStorage.removeItem("tk"); location.reload(); }
+$("#logout").onclick = logout;
+
+async function start() {
+  try { me = await j("/me"); } catch { return; }
+  [MGR, TPL] = await Promise.all([j("/managers"), j("/templates")]);
+  $("#login").classList.add("hide"); $("#app").classList.remove("hide");
+  $("#who").textContent = `${me.full_name} · ${ROLE[me.role]}`;
+  const tabs = [["mine","Văn bản của tôi"]];
+  if (me.role === "manager") tabs.push(["inbox","Chờ tôi duyệt"], ["handled","Đã xử lý"]);
+  if (me.role === "admin") tabs.push(["all","Tất cả văn bản"], ["users","Người dùng"], ["tpl","Luồng ký mẫu"], ["audit","Nhật ký bảo mật"]);
+  $("#nav").innerHTML = tabs.map(t => `<button data-v="${t[0]}">${t[1]}</button>`).join("");
+  $("#nav").onclick = e => e.target.dataset.v && go(e.target.dataset.v);
+  go(me.role === "manager" ? "inbox" : "mine"); loadNotes();
+}
+
+async function loadNotes() {
+  const n = await j("/notifications");
+  $("#bn").textContent = n.length ? `(${n.length})` : "";
+  $("#notes").innerHTML = n.map(x => `<div>${esc(x.message)}<br><small style="color:var(--mut)">${x.created_at} UTC</small></div>`).join("") || "<div>Chưa có thông báo</div>";
+}
+$("#bellbtn").onclick = () => $("#notes").classList.toggle("hide");
+
+function go(v) {
+  view = v;
+  document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.v === v));
+  ({mine: docs, inbox: docs, handled: docs, all: docs, users, tpl, audit})[v](v);
+}
+
+// ---------- danh sách văn bản
+const TITLE = {mine:"Văn bản của tôi", inbox:"Chờ tôi duyệt", handled:"Đã xử lý", all:"Tất cả văn bản"};
+async function docs(scope) {
+  const list = await j("/docs?scope=" + scope);
+  $("#main").innerHTML = `<div class="bar"><h2>${TITLE[scope]}</h2>${scope==="mine"?'<button id="newdoc">Tạo văn bản</button>':""}</div>
+  <table><tr><th>Tiêu đề</th><th>Loại</th><th>Người tạo</th><th>Trạng thái</th><th>Ngày tạo</th></tr>
+  ${list.map(d => `<tr class="row" data-id="${d.id}"><td>${esc(d.title)}${d.confidential?" (mật)":""}</td><td>${esc(d.doc_type)}</td><td>${esc(d.owner)}</td>
+  <td>${chip(d.status)}</td><td>${d.created_at}</td></tr>`).join("") || `<tr><td colspan=5>${scope==="mine"?"Bạn chưa có văn bản nào. Bấm “Tạo văn bản” để bắt đầu.":"Không có văn bản nào."}</td></tr>`}</table>`;
+  document.querySelectorAll("tr.row").forEach(r => r.onclick = () => detail(r.dataset.id));
+  if ($("#newdoc")) $("#newdoc").onclick = newDoc;
+}
+
+function newDoc() {
+  const dlg = $("#dlg");
+  dlg.innerHTML = `<h3>Tạo văn bản mới</h3>
+  <label>Tiêu đề</label><input id="nt">
+  <div class="row2"><div><label>Loại văn bản</label><select id="ntype">${Object.keys(TPL).map(k=>`<option>${esc(k)}</option>`).join("")}</select></div>
+  <div><label>File (PDF hoặc Word, tối đa 10MB)</label><input id="nf" type="file" accept=".pdf,.doc,.docx"></div></div>
+  <label>Người duyệt (theo thứ tự)</label><div id="nap"></div>
+  <label><input type="checkbox" id="nc" style="width:auto"> Tài liệu mật (mã hóa AES-256 khi lưu)</label>
+  <div class="err" id="nerr"></div>
+  <div class="actions"><button id="nok">Lưu nháp</button><button class="ghost" id="ncancel">Đóng</button></div>`;
+  const fill = () => {
+    const ids = TPL[$("#ntype").value] || [];
+    $("#nap").innerHTML = ids.map(i => (MGR.find(m => m.id === i)||{}).full_name).map((n,k)=>`${k+1}. ${esc(n)}`).join("<br>") + '<small style="color:var(--mut)"><br>Luồng mẫu do Admin cấu hình.</small>';
+  };
+  $("#ntype").onchange = fill; fill();
+  $("#ncancel").onclick = () => dlg.close();
+  $("#nok").onclick = async () => {
+    const f = $("#nf").files[0]; if (!$("#nt").value.trim() || !f) { $("#nerr").textContent = "Cần nhập tiêu đề và chọn file"; return; }
+    const fd = new FormData(); fd.append("title", $("#nt").value); fd.append("doc_type", $("#ntype").value);
+    fd.append("confidential", $("#nc").checked); fd.append("file", f);
+    try { await api("/docs", {method:"POST", body: fd}); dlg.close(); go("mine"); } catch (e) { $("#nerr").textContent = e.message; }
+  };
+  dlg.showModal();
+}
+
+// ---------- chi tiết văn bản
+async function detail(id) {
+  const d = await j("/docs/" + id), dlg = $("#dlg");
+  const cur = d.status === "pending" ? d.current_step : 0;
+  dlg.innerHTML = `<h3>${esc(d.title)} ${chip(d.status)}</h3>
+  <div style="color:var(--mut)">${esc(d.doc_type)} · ${esc(d.owner)} · ${esc(d.filename)}${d.confidential?" · mật":""}</div>
+  <div class="hash">SHA-256: ${d.sha256}</div>
+  <ul class="steps">${d.steps.map(s => {
+    const k = s.status !== "waiting" ? s.status : (s.step_order === cur ? "cur" : "");
+    return `<li><span class="seal ${k}">${s.status==="signed"?"ĐÃ KÝ":s.status==="rejected"?"TỪ CHỐI":s.step_order===cur?"ĐANG":"CHỜ"}</span>
+    <div><b>Bước ${s.step_order}: ${esc(s.full_name)}</b><br><small style="color:var(--mut)">${s.signed_at?s.signed_at+" UTC":"Chưa xử lý"}${s.method?" · "+s.method:""}</small>
+    ${s.comment?`<br>“${esc(s.comment)}”`:""}</div></li>`; }).join("")}</ul>
+  <div class="actions"><button class="ghost" id="bview">Xem file</button><button class="ghost" id="bver">Kiểm tra toàn vẹn</button>
+  ${d.is_owner && d.status==="draft" ? '<button id="bsub">Gửi trình ký</button>' : ""}
+  ${d.is_owner && ["draft","pending"].includes(d.status) ? '<button class="ghost" id="bcan">Hủy văn bản</button>' : ""}
+  ${d.can_sign ? '<button id="botp">Lấy mã OTP để ký</button>' : ""}</div>
+  <div id="vres"></div><div id="signbox"></div><div id="prev"></div>
+  <div class="actions"><button class="ghost" id="bclose">Đóng</button></div>`;
+  $("#bclose").onclick = () => dlg.close();
+  $("#bver").onclick = async () => { const v = await j(`/docs/${id}/verify`);
+    $("#vres").innerHTML = v.ok ? '<p class="ok">Toàn vẹn: hash hiện tại khớp với lúc upload.</p>'
+      : `<p class="bad">File đã bị thay đổi. Hash lúc upload ≠ hash hiện tại.</p>`; };
+  $("#bview").onclick = async () => {
+    try { const r = await api(`/docs/${id}/file`); const b = await r.blob();
+      const url = URL.createObjectURL(b);
+      $("#prev").innerHTML = d.filename.toLowerCase().endsWith(".pdf") ? `<iframe src="${url}" title="Xem trước"></iframe>`
+        : `<p><a href="${url}" download="${esc(d.filename)}">Tải file Word về để xem</a></p>`;
+    } catch (e) { $("#vres").innerHTML = `<p class="bad">${esc(e.message)}</p>`; } };
+  const act = (sel, fn) => $(sel) && ($(sel).onclick = async () => { try { await fn(); } catch (e) { toast(e.message); } });
+  act("#bsub", async () => { await api(`/docs/${id}/submit`, {method:"POST"}); dlg.close(); go(view); loadNotes(); });
+  act("#bcan", async () => { if (confirm("Hủy văn bản này?")) { await api(`/docs/${id}/cancel`, {method:"POST"}); dlg.close(); go(view); } });
+  act("#botp", async () => {
+    const o = await j(`/docs/${id}/otp`, {method:"POST"});
+    $("#signbox").innerHTML = `<div class="panel"><p>${esc(o.message)}${o.dev_otp?` <b>(chế độ demo, mã: ${o.dev_otp})</b>`:""}</p>
+      <label>Mã OTP</label><input id="otp" inputmode="numeric" maxlength="6"><label>Ý kiến (không bắt buộc)</label><input id="cmt">
+      <div class="actions"><button id="dosign">Ký duyệt</button><button class="red" id="doreject">Từ chối</button></div></div>`;
+    act("#dosign", async () => { await api(`/docs/${id}/sign`, {method:"POST", json:{otp:$("#otp").value, comment:$("#cmt").value}}); dlg.close(); go(view); });
+    act("#doreject", async () => { const r = prompt("Lý do từ chối:"); if (!r) return;
+      await api(`/docs/${id}/reject`, {method:"POST", json:{reason:r}}); dlg.close(); go(view); });
+  });
+  dlg.showModal();
+}
+
+// ---------- Admin
+async function users() {
+  const l = await j("/admin/users");
+  $("#main").innerHTML = `<div class="bar"><h2>Người dùng</h2></div>
+  <div class="panel"><h3>Thêm tài khoản</h3><div class="row2">
+  <div><label>Tên đăng nhập</label><input id="uu"></div><div><label>Họ tên</label><input id="un"></div>
+  <div><label>Mật khẩu (từ 6 ký tự)</label><input id="up" type="password"></div>
+  <div><label>Vai trò</label><select id="ur"><option value="user">Nhân viên</option><option value="manager">Người duyệt</option><option value="admin">Quản trị</option></select></div>
+  <div><label>Cấp duyệt (1 Trưởng phòng, 2 Giám đốc)</label><input id="ul" type="number" value="0" min="0"></div></div>
+  <div class="actions"><button id="uadd">Thêm</button></div></div>
+  <table><tr><th>Tài khoản</th><th>Họ tên</th><th>Vai trò</th><th>Cấp</th><th>Trạng thái</th><th></th></tr>
+  ${l.map(u => `<tr><td>${esc(u.username)}</td><td>${esc(u.full_name)}</td>
+  <td><select data-r="${u.id}">${["user","manager","admin"].map(r=>`<option value="${r}" ${r===u.role?"selected":""}>${ROLE[r]}</option>`).join("")}</select></td>
+  <td><input data-l="${u.id}" type="number" min="0" value="${u.level}" style="width:70px"></td>
+  <td>${u.active?"Đang dùng":"Đã khóa"}</td>
+  <td><button class="ghost" data-save="${u.id}" data-active="${u.active}">Lưu</button> <button class="ghost" data-tog="${u.id}" data-role="${u.role}">${u.active?"Khóa":"Mở khóa"}</button></td></tr>`).join("")}</table>`;
+  $("#uadd").onclick = async () => { try { await api("/admin/users", {method:"POST", json:{username:$("#uu").value, full_name:$("#un").value,
+      password:$("#up").value, role:$("#ur").value, level:+$("#ul").value}}); MGR = await j("/managers"); users(); } catch (e) { toast(e.message); } };
+  const upd = async (id, active) => { try { await api("/admin/users/" + id, {method:"PUT", json:{role:document.querySelector(`[data-r="${id}"]`).value,
+      level:+document.querySelector(`[data-l="${id}"]`).value, active}}); MGR = await j("/managers"); users(); } catch (e) { toast(e.message); } };
+  document.querySelectorAll("[data-save]").forEach(b => b.onclick = () => upd(b.dataset.save, b.dataset.active === "1"));
+  document.querySelectorAll("[data-tog]").forEach(b => b.onclick = () => upd(b.dataset.tog, b.textContent !== "Khóa"));
+}
+
+async function tpl() {
+  TPL = await j("/templates");
+  $("#main").innerHTML = `<div class="bar"><h2>Luồng ký mẫu</h2></div><p style="color:var(--mut)">Chọn người duyệt theo thứ tự cho từng loại văn bản. Văn bản mới sẽ dùng luồng này.</p>
+  ${Object.entries(TPL).map(([t, ids]) => `<div class="panel"><h3>${esc(t)}</h3>
+   <div class="row2"><div><label>Bước 1</label><select data-t="${esc(t)}" data-i="0">${opts(ids[0])}</select></div>
+   <div><label>Bước 2</label><select data-t="${esc(t)}" data-i="1"><option value="">(không có)</option>${opts(ids[1])}</select></div></div>
+   <div class="actions"><button data-st="${esc(t)}">Lưu luồng</button></div></div>`).join("")}`;
+  document.querySelectorAll("[data-st]").forEach(b => b.onclick = async () => {
+    const ids = [...document.querySelectorAll(`select[data-t="${b.dataset.st}"]`)].map(s => +s.value).filter(Boolean);
+    try { await api("/admin/templates/" + encodeURIComponent(b.dataset.st), {method:"PUT", json:{approver_ids: ids}}); toast("Đã lưu luồng ký"); } catch (e) { toast(e.message); } });
+}
+const opts = sel => MGR.map(m => `<option value="${m.id}" ${m.id===sel?"selected":""}>${esc(m.full_name)}</option>`).join("");
+
+async function audit() {
+  const a = await j("/admin/audit");
+  $("#main").innerHTML = `<div class="bar"><h2>Nhật ký bảo mật</h2></div>
+  <p class="${a.chain_ok?"ok":"bad"}">${a.chain_ok?"Chuỗi hash của nhật ký còn nguyên vẹn.":"CẢNH BÁO: nhật ký đã bị can thiệp, chuỗi hash bị đứt."}</p>
+  <table><tr><th>Thời gian (UTC)</th><th>Người dùng</th><th>Thao tác</th><th>Văn bản</th><th>IP</th><th>Chi tiết</th></tr>
+  ${a.rows.map(r => `<tr><td>${r.ts}</td><td>${esc(r.full_name||"-")}</td><td>${esc(r.action)}</td><td>${r.doc_id??"-"}</td><td>${esc(r.ip)}</td><td class="hash">${esc(r.detail)}</td></tr>`).join("")}</table>`;
+}
+
+if (token) start();
+</script>
+</body>
+</html>
