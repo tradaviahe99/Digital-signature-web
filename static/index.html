@@ -90,16 +90,16 @@ async function api(path, o = {}) {
 const j = async (p, o) => (await api(p, o)).json();
 const toast = m => alert(m);
 
-// ---------- đăng nhập
+// ---------- [M20] đăng nhập, phân quyền theo vai trò
 $("#lbtn").onclick = async () => {
   try {
     const r = await fetch("/api/login", {method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({username: $("#lu").value, password: $("#lp").value})});
     const d = await r.json(); if (!r.ok) throw new Error(d.detail);
     token = d.token; sessionStorage.setItem("tk", token); start();
-  } catch (e) { $("#lerr").textContent = e.message; }
+  } catch (e) { $("#lerr").textContent = e.message; $("#lp").value = ""; $("#lp").focus(); }
 };
-$("#lp").onkeydown = e => e.key === "Enter" && $("#lbtn").click();
+for (const id of ["#lu", "#lp"]) $(id).addEventListener("keydown", e => { if (e.key === "Enter") $("#lbtn").click(); });
 function logout() { sessionStorage.removeItem("tk"); location.reload(); }
 $("#logout").onclick = logout;
 
@@ -110,7 +110,8 @@ async function start() {
   $("#who").textContent = `${me.full_name} · ${ROLE[me.role]}`;
   const tabs = [["mine","Văn bản của tôi"]];
   if (me.role === "manager") tabs.push(["inbox","Chờ tôi duyệt"], ["handled","Đã xử lý"]);
-  if (me.role === "admin") tabs.push(["all","Tất cả văn bản"], ["users","Người dùng"], ["tpl","Luồng ký mẫu"], ["audit","Nhật ký bảo mật"]);
+  if (me.role === "admin") tabs.push(["all","Tất cả văn bản"], ["users","Người dùng"], ["tpl","Luồng ký mẫu"], ["audit","Nhật ký bảo mật"], ["backup","Sao lưu"]);
+  tabs.push(["box","Hộp thư"], ["dir","Danh bạ"]);
   $("#nav").innerHTML = tabs.map(t => `<button data-v="${t[0]}">${t[1]}</button>`).join("");
   $("#nav").onclick = e => e.target.dataset.v && go(e.target.dataset.v);
   go(me.role === "manager" ? "inbox" : "mine"); loadNotes();
@@ -126,10 +127,10 @@ $("#bellbtn").onclick = () => $("#notes").classList.toggle("hide");
 function go(v) {
   view = v;
   document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.v === v));
-  ({mine: docs, inbox: docs, handled: docs, all: docs, users, tpl, audit})[v](v);
+  ({mine: docs, inbox: docs, handled: docs, all: docs, users, tpl, audit, backup, dir: dirView, box: boxView})[v](v);
 }
 
-// ---------- danh sách văn bản
+// ---------- [M15] danh sách văn bản và form tạo mới
 const TITLE = {mine:"Văn bản của tôi", inbox:"Chờ tôi duyệt", handled:"Đã xử lý", all:"Tất cả văn bản"};
 async function docs(scope) {
   const list = await j("/docs?scope=" + scope);
@@ -153,7 +154,7 @@ function newDoc() {
   <div class="actions"><button id="nok">Lưu nháp</button><button class="ghost" id="ncancel">Đóng</button></div>`;
   const fill = () => {
     const ids = TPL[$("#ntype").value] || [];
-    $("#nap").innerHTML = ids.map(i => (MGR.find(m => m.id === i)||{}).full_name).map((n,k)=>`${k+1}. ${esc(n)}`).join("<br>") + '<small style="color:var(--mut)"><br>Luồng mẫu do Admin cấu hình.</small>';
+    $("#nap").innerHTML = ids.map(i => { const m = MGR.find(x => x.id === i) || {}; return (m.full_name || "?") + (m.position ? " – " + m.position : ""); }).map((n,k)=>`${k+1}. ${esc(n)}`).join("<br>") + '<small style="color:var(--mut)"><br>Luồng mẫu do Admin cấu hình.</small>';
   };
   $("#ntype").onchange = fill; fill();
   $("#ncancel").onclick = () => dlg.close();
@@ -166,7 +167,7 @@ function newDoc() {
   dlg.showModal();
 }
 
-// ---------- chi tiết văn bản
+// ---------- [M15] tiến độ ký, ký/từ chối ([M20] OTP, [M21] kiểm tra toàn vẹn)
 async function detail(id) {
   const d = await j("/docs/" + id), dlg = $("#dlg");
   const cur = d.status === "pending" ? d.current_step : 0;
@@ -176,9 +177,9 @@ async function detail(id) {
   <ul class="steps">${d.steps.map(s => {
     const k = s.status !== "waiting" ? s.status : (s.step_order === cur ? "cur" : "");
     return `<li><span class="seal ${k}">${s.status==="signed"?"ĐÃ KÝ":s.status==="rejected"?"TỪ CHỐI":s.step_order===cur?"ĐANG":"CHỜ"}</span>
-    <div><b>Bước ${s.step_order}: ${esc(s.full_name)}</b><br><small style="color:var(--mut)">${s.signed_at?s.signed_at+" UTC":"Chưa xử lý"}${s.method?" · "+s.method:""}</small>
+    <div><b>Bước ${s.step_order}: ${esc(s.full_name)}${s.position?" – "+esc(s.position):""}</b><br><small style="color:var(--mut)">${s.signed_at?s.signed_at+" UTC":"Chưa xử lý"}${s.method?" · "+s.method:""}</small>
     ${s.comment?`<br>“${esc(s.comment)}”`:""}</div></li>`; }).join("")}</ul>
-  <div class="actions"><button class="ghost" id="bview">Xem file</button><button class="ghost" id="bver">Kiểm tra toàn vẹn</button>
+  <div class="actions"><button class="ghost" id="bview">Xem file</button><button class="ghost" id="bver">Kiểm tra toàn vẹn</button><button class="ghost" id="bsig">Kiểm tra chữ ký số</button>
   ${d.is_owner && d.status==="draft" ? '<button id="bsub">Gửi trình ký</button>' : ""}
   ${d.is_owner && ["draft","pending"].includes(d.status) ? '<button class="ghost" id="bcan">Hủy văn bản</button>' : ""}
   ${d.can_sign ? '<button id="botp">Lấy mã OTP để ký</button>' : ""}</div>
@@ -188,6 +189,8 @@ async function detail(id) {
   $("#bver").onclick = async () => { const v = await j(`/docs/${id}/verify`);
     $("#vres").innerHTML = v.ok ? '<p class="ok">Toàn vẹn: hash hiện tại khớp với lúc upload.</p>'
       : `<p class="bad">File đã bị thay đổi. Hash lúc upload ≠ hash hiện tại.</p>`; };
+  $("#bsig").onclick = async () => { const l = await j(`/docs/${id}/signatures`);
+    $("#vres").innerHTML = l.length ? l.map(s => `<p class="${s.valid?"ok":"bad"}">Bước ${s.step} · ${esc(s.signer)}: ${s.valid?"chữ ký số hợp lệ":esc(s.reason)}<br><small class="hash">Mã khóa công khai: ${esc(s.fingerprint||"-")}</small></p>`).join("") : "<p>Chưa có chữ ký nào.</p>"; };
   $("#bview").onclick = async () => {
     try { const r = await api(`/docs/${id}/file`); const b = await r.blob();
       const url = URL.createObjectURL(b);
@@ -200,16 +203,16 @@ async function detail(id) {
   act("#botp", async () => {
     const o = await j(`/docs/${id}/otp`, {method:"POST"});
     $("#signbox").innerHTML = `<div class="panel"><p>${esc(o.message)}${o.dev_otp?` <b>(chế độ demo, mã: ${o.dev_otp})</b>`:""}</p>
-      <label>Mã OTP</label><input id="otp" inputmode="numeric" maxlength="6"><label>Ý kiến (không bắt buộc)</label><input id="cmt">
+      <label>Mã OTP</label><input id="otp" inputmode="numeric" maxlength="6"><label>Mật khẩu của bạn (để mở khóa chữ ký số)</label><input id="pw" type="password" autocomplete="current-password"><label>Ý kiến (không bắt buộc)</label><input id="cmt">
       <div class="actions"><button id="dosign">Ký duyệt</button><button class="red" id="doreject">Từ chối</button></div></div>`;
-    act("#dosign", async () => { await api(`/docs/${id}/sign`, {method:"POST", json:{otp:$("#otp").value, comment:$("#cmt").value}}); dlg.close(); go(view); });
+    act("#dosign", async () => { await api(`/docs/${id}/sign`, {method:"POST", json:{otp:$("#otp").value, password:$("#pw").value, comment:$("#cmt").value}}); dlg.close(); go(view); });
     act("#doreject", async () => { const r = prompt("Lý do từ chối:"); if (!r) return;
       await api(`/docs/${id}/reject`, {method:"POST", json:{reason:r}}); dlg.close(); go(view); });
   });
   dlg.showModal();
 }
 
-// ---------- Admin
+// ---------- Admin: [M20] quản lý người dùng
 async function users() {
   const l = await j("/admin/users");
   $("#main").innerHTML = `<div class="bar"><h2>Người dùng</h2></div>
@@ -217,22 +220,24 @@ async function users() {
   <div><label>Tên đăng nhập</label><input id="uu"></div><div><label>Họ tên</label><input id="un"></div>
   <div><label>Mật khẩu (từ 6 ký tự)</label><input id="up" type="password"></div>
   <div><label>Vai trò</label><select id="ur"><option value="user">Nhân viên</option><option value="manager">Người duyệt</option><option value="admin">Quản trị</option></select></div>
-  <div><label>Cấp duyệt (1 Trưởng phòng, 2 Giám đốc)</label><input id="ul" type="number" value="0" min="0"></div></div>
+  <div><label>Cấp duyệt (1 Trưởng phòng, 2 Giám đốc)</label><input id="ul" type="number" value="0" min="0"></div>
+  <div><label>Chức vụ (hiện trong danh bạ)</label><input id="upos"></div></div>
   <div class="actions"><button id="uadd">Thêm</button></div></div>
-  <table><tr><th>Tài khoản</th><th>Họ tên</th><th>Vai trò</th><th>Cấp</th><th>Trạng thái</th><th></th></tr>
-  ${l.map(u => `<tr><td>${esc(u.username)}</td><td>${esc(u.full_name)}</td>
+  <table><tr><th>Tài khoản</th><th>Họ tên</th><th>Chức vụ</th><th>Vai trò</th><th>Cấp</th><th>Trạng thái</th><th></th></tr>
+  ${l.map(u => `<tr><td>${esc(u.username)}</td><td>${esc(u.full_name)}</td><td><input data-pos="${u.id}" value="${esc(u.position)}"></td>
   <td><select data-r="${u.id}">${["user","manager","admin"].map(r=>`<option value="${r}" ${r===u.role?"selected":""}>${ROLE[r]}</option>`).join("")}</select></td>
   <td><input data-l="${u.id}" type="number" min="0" value="${u.level}" style="width:70px"></td>
   <td>${u.active?"Đang dùng":"Đã khóa"}</td>
   <td><button class="ghost" data-save="${u.id}" data-active="${u.active}">Lưu</button> <button class="ghost" data-tog="${u.id}" data-role="${u.role}">${u.active?"Khóa":"Mở khóa"}</button></td></tr>`).join("")}</table>`;
   $("#uadd").onclick = async () => { try { await api("/admin/users", {method:"POST", json:{username:$("#uu").value, full_name:$("#un").value,
-      password:$("#up").value, role:$("#ur").value, level:+$("#ul").value}}); MGR = await j("/managers"); users(); } catch (e) { toast(e.message); } };
+      password:$("#up").value, role:$("#ur").value, level:+$("#ul").value, position:$("#upos").value}}); MGR = await j("/managers"); users(); } catch (e) { toast(e.message); } };
   const upd = async (id, active) => { try { await api("/admin/users/" + id, {method:"PUT", json:{role:document.querySelector(`[data-r="${id}"]`).value,
-      level:+document.querySelector(`[data-l="${id}"]`).value, active}}); MGR = await j("/managers"); users(); } catch (e) { toast(e.message); } };
+      level:+document.querySelector(`[data-l="${id}"]`).value, position:document.querySelector(`[data-pos="${id}"]`).value, active}}); MGR = await j("/managers"); users(); } catch (e) { toast(e.message); } };
   document.querySelectorAll("[data-save]").forEach(b => b.onclick = () => upd(b.dataset.save, b.dataset.active === "1"));
   document.querySelectorAll("[data-tog]").forEach(b => b.onclick = () => upd(b.dataset.tog, b.textContent !== "Khóa"));
 }
 
+// [M15] cấu hình luồng ký mẫu
 async function tpl() {
   TPL = await j("/templates");
   $("#main").innerHTML = `<div class="bar"><h2>Luồng ký mẫu</h2></div><p style="color:var(--mut)">Chọn người duyệt theo thứ tự cho từng loại văn bản. Văn bản mới sẽ dùng luồng này.</p>
@@ -244,14 +249,119 @@ async function tpl() {
     const ids = [...document.querySelectorAll(`select[data-t="${b.dataset.st}"]`)].map(s => +s.value).filter(Boolean);
     try { await api("/admin/templates/" + encodeURIComponent(b.dataset.st), {method:"PUT", json:{approver_ids: ids}}); toast("Đã lưu luồng ký"); } catch (e) { toast(e.message); } });
 }
-const opts = sel => MGR.map(m => `<option value="${m.id}" ${m.id===sel?"selected":""}>${esc(m.full_name)}</option>`).join("");
+const opts = sel => MGR.map(m => `<option value="${m.id}" ${m.id===sel?"selected":""}>${esc(m.full_name)}${m.position?" – "+esc(m.position):""}</option>`).join("");
 
+// [M21] xem nhật ký bảo mật
 async function audit() {
   const a = await j("/admin/audit");
   $("#main").innerHTML = `<div class="bar"><h2>Nhật ký bảo mật</h2></div>
   <p class="${a.chain_ok?"ok":"bad"}">${a.chain_ok?"Chuỗi hash của nhật ký còn nguyên vẹn.":"CẢNH BÁO: nhật ký đã bị can thiệp, chuỗi hash bị đứt."}</p>
   <table><tr><th>Thời gian (UTC)</th><th>Người dùng</th><th>Thao tác</th><th>Văn bản</th><th>IP</th><th>Chi tiết</th></tr>
   ${a.rows.map(r => `<tr><td>${r.ts}</td><td>${esc(r.full_name||"-")}</td><td>${esc(r.action)}</td><td>${r.doc_id??"-"}</td><td>${esc(r.ip)}</td><td class="hash">${esc(r.detail)}</td></tr>`).join("")}</table>`;
+}
+
+// ---------- [M20] danh bạ: tên và chức vụ mọi người trong công ty
+let DIR = [];
+const loadDir = async () => { DIR = await j("/directory"); };
+async function dirView() {
+  await loadDir();
+  $("#main").innerHTML = `<div class="bar"><h2>Danh bạ công ty</h2><input id="dq" placeholder="Tìm theo tên hoặc chức vụ" style="max-width:280px"><button id="dsend">Gửi văn bản</button></div>
+  <table><tr><th>Họ tên</th><th>Chức vụ</th><th></th></tr><tbody id="dbody"></tbody></table>`;
+  const draw = () => { const q = $("#dq").value.toLowerCase();
+    $("#dbody").innerHTML = DIR.filter(p => (p.full_name + " " + p.position).toLowerCase().includes(q)).map(p =>
+      `<tr><td>${esc(p.full_name)}${p.me ? " (bạn)" : ""}</td><td>${esc(p.position)}</td><td>${p.me ? "" : `<button class="ghost" data-to="${p.id}">Gửi văn bản</button>`}</td></tr>`).join("")
+      || "<tr><td colspan=3>Không tìm thấy ai.</td></tr>";
+    document.querySelectorAll("[data-to]").forEach(b => b.onclick = () => sendDialog(+b.dataset.to)); };
+  $("#dq").oninput = draw; draw();
+  $("#dsend").onclick = () => sendDialog();
+}
+
+// ---------- [M15] gửi văn bản cho người trong công ty (cửa sổ bật lên)
+async function sendDialog(pre) {
+  await loadDir();
+  const dlg = $("#dlg"); dlg.onclose = null;
+  dlg.innerHTML = `<h3>Gửi văn bản</h3>
+  <label for="st">Tiêu đề</label><input id="st">
+  <label for="sm">Lời nhắn (không bắt buộc)</label><textarea id="sm" rows="2"></textarea>
+  <label for="sf">File (PDF hoặc Word, tối đa 10MB)</label><input id="sf" type="file" accept=".pdf,.doc,.docx">
+  <label><input type="checkbox" id="sc" style="width:auto"> Tài liệu mật (mã hóa AES-256 khi lưu)</label>
+  <label for="sq">Người nhận</label><input id="sq" placeholder="Tìm theo tên hoặc chức vụ">
+  <div id="slist" style="max-height:220px;overflow:auto;border:1px solid var(--line);margin-top:.4rem;background:#fff"></div>
+  <div class="err" id="serr"></div>
+  <div class="actions"><button id="sgo">Gửi</button><button class="ghost" id="scancel">Đóng</button><span id="scount" style="color:var(--mut)"></span></div>`;
+  const sel = new Set(pre ? [pre] : []);
+  const count = () => { $("#scount").textContent = `Đã chọn ${sel.size} người`; };
+  const draw = () => { const q = $("#sq").value.toLowerCase();
+    $("#slist").innerHTML = DIR.filter(p => !p.me && (p.full_name + " " + p.position).toLowerCase().includes(q)).map(p =>
+      `<label style="display:flex;gap:.6rem;align-items:center;margin:0;padding:.4rem .7rem;border-bottom:1px solid var(--line);color:var(--ink);font-size:14px">
+       <input type="checkbox" style="width:auto" data-p="${p.id}" ${sel.has(p.id) ? "checked" : ""}> <b>${esc(p.full_name)}</b> <span style="color:var(--mut)">${esc(p.position)}</span></label>`).join("")
+      || "<div style='padding:.7rem'>Không tìm thấy ai.</div>";
+    document.querySelectorAll("[data-p]").forEach(cb => cb.onchange = () => { cb.checked ? sel.add(+cb.dataset.p) : sel.delete(+cb.dataset.p); count(); });
+    count(); };
+  $("#sq").oninput = draw; draw();
+  $("#scancel").onclick = () => dlg.close();
+  $("#sgo").onclick = async () => {
+    const f = $("#sf").files[0];
+    if (!$("#st").value.trim() || !f || !sel.size) { $("#serr").textContent = "Cần nhập tiêu đề, chọn file và chọn ít nhất 1 người nhận"; return; }
+    const fd = new FormData(); fd.append("title", $("#st").value); fd.append("message", $("#sm").value);
+    fd.append("recipients", [...sel].join(",")); fd.append("confidential", $("#sc").checked); fd.append("file", f);
+    try { const r = await j("/shares", {method: "POST", body: fd}); dlg.close(); toast(`Đã gửi cho ${r.recipients} người`); go("box"); }
+    catch (e) { $("#serr").textContent = e.message; } };
+  dlg.showModal();
+}
+
+// ---------- [M15] hộp thư: file đã nhận / đã gửi
+async function boxView() {
+  const [inb, sent] = await Promise.all([j("/shares?box=inbox"), j("/shares?box=sent")]);
+  $("#main").innerHTML = `<div class="bar"><h2>Hộp thư</h2><button id="tosend">Gửi văn bản</button></div>
+  <h3>Đã nhận</h3><table><tr><th>Tiêu đề</th><th>Người gửi</th><th>Ngày gửi (UTC)</th><th>Trạng thái</th></tr>
+  ${inb.map(s => `<tr class="row" data-i="${s.id}"><td>${esc(s.title)}${s.confidential ? " (mật)" : ""}</td>
+  <td>${esc(s.sender)}<br><small style="color:var(--mut)">${esc(s.sender_position)}</small></td><td>${s.created_at}</td><td>${s.read_at ? "Đã xem" : "<b>Mới</b>"}</td></tr>`).join("")
+    || "<tr><td colspan=4>Bạn chưa nhận file nào.</td></tr>"}</table>
+  <h3 style="margin-top:1.5rem">Đã gửi</h3><table><tr><th>Tiêu đề</th><th>Người nhận</th><th>Ngày gửi (UTC)</th></tr>
+  ${sent.map(s => `<tr class="row" data-s="${s.id}"><td>${esc(s.title)}${s.confidential ? " (mật)" : ""}</td>
+  <td>${s.recipients.map(r => esc(r.full_name) + (r.read_at ? " (đã xem)" : "")).join(", ")}</td><td>${s.created_at}</td></tr>`).join("")
+    || "<tr><td colspan=3>Bạn chưa gửi file nào.</td></tr>"}</table>`;
+  $("#tosend").onclick = () => sendDialog();
+  document.querySelectorAll("[data-i]").forEach(r => r.onclick = () => shareDialog(inb.find(s => s.id == r.dataset.i), false));
+  document.querySelectorAll("[data-s]").forEach(r => r.onclick = () => shareDialog(sent.find(s => s.id == r.dataset.s), true));
+}
+
+function shareDialog(s, isSent) {
+  const dlg = $("#dlg");
+  dlg.innerHTML = `<h3>${esc(s.title)}${s.confidential ? " (mật)" : ""}</h3>
+  <div style="color:var(--mut)">${isSent ? "Bạn đã gửi" : "Từ " + esc(s.sender) + " · " + esc(s.sender_position)} · ${s.created_at} UTC · ${esc(s.filename)}</div>
+  ${s.message ? `<div class="panel" style="margin-top:.8rem">${esc(s.message)}</div>` : ""}
+  ${isSent ? `<p><b>Người nhận:</b></p><ul>${s.recipients.map(r => `<li>${esc(r.full_name)} · ${esc(r.position)} · ${r.read_at ? "đã xem lúc " + r.read_at + " UTC" : "chưa xem"}</li>`).join("")}</ul>` : ""}
+  <div class="actions"><button class="ghost" id="shv">Xem / tải file</button><button class="ghost" id="shc">Đóng</button></div>
+  <div id="shres"></div><div id="shprev"></div>`;
+  dlg.onclose = () => { dlg.onclose = null; if (view === "box") boxView(); loadNotes(); };
+  $("#shc").onclick = () => dlg.close();
+  $("#shv").onclick = async () => {
+    try { const b = await (await api(`/shares/${s.id}/file`)).blob(), url = URL.createObjectURL(b);
+      $("#shprev").innerHTML = s.filename.toLowerCase().endsWith(".pdf") ? `<iframe src="${url}" title="Xem trước"></iframe>`
+        : `<p><a href="${url}" download="${esc(s.filename)}">Tải file về để xem</a></p>`;
+    } catch (e) { $("#shres").innerHTML = `<p class="bad">${esc(e.message)}</p>`; } };
+  dlg.showModal();
+}
+
+// [M21] sao lưu và khôi phục (Admin)
+async function backup() {
+  const l = await j("/admin/backups");
+  $("#main").innerHTML = `<div class="bar"><h2>Sao lưu và khôi phục</h2><button id="bk">Tạo bản sao lưu</button></div>
+  <p style="color:var(--mut)">Mỗi bản sao lưu gồm cơ sở dữ liệu (cả nhật ký ký số) và toàn bộ file văn bản, kèm hash từng file để kiểm tra khi khôi phục. Trước khi khôi phục, hệ thống tự lưu lại trạng thái hiện tại.</p>
+  <table><tr><th>Tên bản sao lưu</th><th>Thời gian (UTC)</th><th>Dung lượng</th><th></th></tr>
+  ${l.map(b => `<tr><td>${esc(b.name)}</td><td>${b.created}</td><td>${(b.size/1024).toFixed(1)} KB</td>
+  <td><button class="ghost" data-dl="${esc(b.name)}">Tải về</button> <button class="red" data-rs="${esc(b.name)}">Khôi phục</button></td></tr>`).join("") || "<tr><td colspan=4>Chưa có bản sao lưu nào.</td></tr>"}</table>`;
+  $("#bk").onclick = async () => { try { await api("/admin/backups", {method:"POST"}); backup(); } catch (e) { toast(e.message); } };
+  document.querySelectorAll("[data-dl]").forEach(b => b.onclick = async () => { try {
+    const blob = await (await api(`/admin/backups/${b.dataset.dl}/download`)).blob();
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = b.dataset.dl; a.click(); } catch (e) { toast(e.message); } });
+  document.querySelectorAll("[data-rs]").forEach(b => b.onclick = async () => {
+    if (!confirm("Khôi phục sẽ thay toàn bộ dữ liệu hiện tại bằng bản này. Tiếp tục?")) return;
+    try { const r = await j(`/admin/backups/${b.dataset.rs}/restore`, {method:"POST"});
+      [MGR, TPL] = await Promise.all([j("/managers"), j("/templates")]); loadNotes();
+      toast("Đã khôi phục. Trạng thái trước đó được lưu ở: " + r.safety_backup); backup(); } catch (e) { toast(e.message); } });
 }
 
 if (token) start();

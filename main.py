@@ -2,14 +2,17 @@
 Hệ thống Trình ký văn bản và Phê duyệt điện tử  (M15 + M20 + M21)
 Chạy:  uvicorn main:app --reload
 """
-import os, json, hashlib, hmac, secrets, sqlite3, random
+import os, json, hashlib, hmac, secrets, sqlite3, random, base64, re, zipfile
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import jwt
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
-from fastapi.responses import Response
+from fastapi.responses import Response, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -17,7 +20,9 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(BASE, "data")
 UPLOADS = os.path.join(DATA, "uploads")
 DB_PATH = os.path.join(DATA, "esign.db")
+BACKUPS = os.path.join(DATA, "backups")
 os.makedirs(UPLOADS, exist_ok=True)
+os.makedirs(BACKUPS, exist_ok=True)
 
 # Bật để hiện mã OTP ngay trên màn hình khi demo (thật thì gửi email/SMS). Đặt SHOW_OTP=0 để tắt.
 SHOW_OTP = os.environ.get("SHOW_OTP", "1") == "1"
@@ -41,7 +46,8 @@ CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL,
   full_name TEXT NOT NULL, email TEXT, role TEXT NOT NULL,      -- user | manager | admin
   level INTEGER DEFAULT 0,                                      -- cấp duyệt: 1 Trưởng phòng, 2 Giám đốc
-  active INTEGER DEFAULT 1);
+  active INTEGER DEFAULT 1,
+  public_key TEXT, private_key_enc TEXT);                       -- khóa RSA (khóa riêng được mã hóa bằng mật khẩu)
 CREATE TABLE IF NOT EXISTS documents(
   id INTEGER PRIMARY KEY, title TEXT NOT NULL, doc_type TEXT NOT NULL, owner_id INTEGER NOT NULL,
   filename TEXT NOT NULL, stored_path TEXT NOT NULL, confidential INTEGER DEFAULT 0,
@@ -50,12 +56,19 @@ CREATE TABLE IF NOT EXISTS documents(
 CREATE TABLE IF NOT EXISTS workflow_steps(
   id INTEGER PRIMARY KEY, doc_id INTEGER NOT NULL, step_order INTEGER NOT NULL, approver_id INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'waiting',                       -- waiting|signed|rejected
-  signed_at TEXT, comment TEXT, hash_at_sign TEXT, method TEXT);
+  signed_at TEXT, comment TEXT, hash_at_sign TEXT, method TEXT,
+  signature TEXT, sig_payload TEXT, key_fingerprint TEXT);
 CREATE TABLE IF NOT EXISTS workflow_templates(doc_type TEXT PRIMARY KEY, approver_ids TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS otps(id INTEGER PRIMARY KEY, user_id INTEGER, doc_id INTEGER,
   code_hash TEXT, expires TEXT, used INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY, user_id INTEGER, doc_id INTEGER,
   message TEXT, created_at TEXT);
+CREATE TABLE IF NOT EXISTS shares(
+  id INTEGER PRIMARY KEY, sender_id INTEGER NOT NULL, title TEXT NOT NULL, message TEXT,
+  filename TEXT NOT NULL, stored_path TEXT NOT NULL, confidential INTEGER DEFAULT 0,
+  sha256 TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS share_recipients(
+  share_id INTEGER NOT NULL, user_id INTEGER NOT NULL, read_at TEXT, PRIMARY KEY(share_id, user_id));
 CREATE TABLE IF NOT EXISTS audit_logs(
   id INTEGER PRIMARY KEY, ts TEXT, user_id INTEGER, action TEXT, doc_id INTEGER, ip TEXT, detail TEXT,
   prev_hash TEXT, hash TEXT);
@@ -91,27 +104,42 @@ def check_pw(pw: str, stored: str) -> bool:
 def init_db():
     c = db()
     c.executescript(SCHEMA)
+    for table, col in [("users", "position"), ("users", "public_key"), ("users", "private_key_enc"), ("workflow_steps", "signature"),
+                       ("workflow_steps", "sig_payload"), ("workflow_steps", "key_fingerprint")]:  # nâng cấp CSDL cũ
+        if col not in [r[1] for r in c.execute(f"PRAGMA table_info({table})")]:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
     if not c.execute("SELECT 1 FROM users").fetchone():
         seed = [("admin", "admin123", "Quản trị viên", "admin", 0),
-                ("nhanvien", "123456", "Nguyễn Văn An (Nhân viên)", "user", 0),
-                ("truongphong", "123456", "Trần Thị Bình (Trưởng phòng)", "manager", 1),
-                ("giamdoc", "123456", "Lê Văn Cường (Giám đốc)", "manager", 2)]
+                ("nhanvien", "123456", "Nguyễn Văn An", "user", 0),
+                ("truongphong", "123456", "Trần Thị Bình", "manager", 1),
+                ("giamdoc", "123456", "Lê Văn Cường", "manager", 2)]
         for u, p, n, r, lv in seed:
             c.execute("INSERT INTO users(username,password,full_name,email,role,level) VALUES(?,?,?,?,?,?)",
                       (u, hash_pw(p), n, f"{u}@example.com", r, lv))
         c.execute("INSERT INTO workflow_templates VALUES('Đơn từ','[3]')")
         c.execute("INSERT INTO workflow_templates VALUES('Quyết định','[3,4]')")
         c.execute("INSERT INTO workflow_templates VALUES('Công văn','[3,4]')")
+    # tên cũ có kèm chức vụ trong ngoặc -> bỏ đi vì đã có cột chức vụ riêng
+    for uname, old, new in [("nhanvien", "Nguyễn Văn An (Nhân viên)", "Nguyễn Văn An"),
+                            ("truongphong", "Trần Thị Bình (Trưởng phòng)", "Trần Thị Bình"),
+                            ("giamdoc", "Lê Văn Cường (Giám đốc)", "Lê Văn Cường")]:
+        c.execute("UPDATE users SET full_name=? WHERE username=? AND full_name=?", (new, uname, old))
+    c.execute("""UPDATE users SET position = CASE WHEN role='admin' THEN 'Quản trị viên'
+                 WHEN role='manager' AND level=1 THEN 'Trưởng phòng' WHEN role='manager' AND level=2 THEN 'Giám đốc'
+                 WHEN role='manager' THEN 'Người duyệt' ELSE 'Nhân viên' END
+                 WHERE position IS NULL OR position=''""")
     c.commit(); c.close()
 
 
 init_db()
 
 # ---------------------------------------------------------------- M21: hash, mã hóa, audit log
+# [M21] Hash SHA-256
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+# [M21] Mã hóa AES-256 khi lưu
 def save_file(data: bytes, confidential: bool) -> str:
     """Tài liệu mật được mã hóa AES-256-GCM trước khi ghi xuống đĩa."""
     path = os.path.join(UPLOADS, secrets.token_hex(12))
@@ -140,6 +168,7 @@ def read_verified(doc):
     return sha256(data) == doc["sha256"], data
 
 
+# [M21] Audit log nối chuỗi hash
 def log(c, user_id, action, doc_id, ip, detail=""):
     """Mỗi dòng log chứa hash của dòng trước -> sửa 1 dòng là đứt chuỗi."""
     last = c.execute("SELECT hash FROM audit_logs ORDER BY id DESC LIMIT 1").fetchone()
@@ -194,6 +223,7 @@ class LoginIn(BaseModel):
     password: str
 
 
+# [M20] Xác thực: đăng nhập, cấp JWT
 @app.post("/api/login")
 def login(b: LoginIn, request: Request):
     c = db()
@@ -209,15 +239,17 @@ def login(b: LoginIn, request: Request):
     return {"token": token, "user": {k: u[k] for k in ("id", "username", "full_name", "role", "level")}}
 
 
+# [M20] Xác thực: thông tin người đang đăng nhập
 @app.get("/api/me")
 def me(u=Depends(current_user)):
     return {k: u[k] for k in ("id", "username", "full_name", "role", "level")}
 
 
+# [M20] Phân quyền: danh sách người duyệt
 @app.get("/api/managers")
 def managers(u=Depends(current_user)):
     c = db()
-    rows = c.execute("SELECT id,full_name,level FROM users WHERE role='manager' AND active=1 ORDER BY level").fetchall()
+    rows = c.execute("SELECT id,full_name,position,level FROM users WHERE role='manager' AND active=1 ORDER BY level").fetchall()
     c.close()
     return [dict(r) for r in rows]
 
@@ -229,30 +261,35 @@ class UserIn(BaseModel):
     full_name: str
     role: str
     level: int = 0
+    position: str = ""
 
 
 class UserEdit(BaseModel):
     role: str
     level: int = 0
     active: bool = True
+    position: str = ""
 
 
+# [M20] Phân quyền: quản lý tài khoản (Admin)
 @app.get("/api/admin/users")
 def list_users(u=Depends(require("admin"))):
     c = db()
-    rows = c.execute("SELECT id,username,full_name,role,level,active FROM users ORDER BY id").fetchall()
+    rows = c.execute("SELECT id,username,full_name,position,role,level,active FROM users ORDER BY id").fetchall()
     c.close()
     return [dict(r) for r in rows]
 
 
+# [M20] Phân quyền: quản lý tài khoản (Admin)
 @app.post("/api/admin/users")
 def create_user(b: UserIn, request: Request, u=Depends(require("admin"))):
     if b.role not in ("user", "manager", "admin") or len(b.password) < 6:
         raise HTTPException(400, "Vai trò không hợp lệ hoặc mật khẩu dưới 6 ký tự")
     c = db()
     try:
-        c.execute("INSERT INTO users(username,password,full_name,email,role,level) VALUES(?,?,?,?,?,?)",
-                  (b.username, hash_pw(b.password), b.full_name, f"{b.username}@example.com", b.role, b.level))
+        pos = b.position.strip() or {"user": "Nhân viên", "manager": "Người duyệt", "admin": "Quản trị viên"}[b.role]
+        c.execute("INSERT INTO users(username,password,full_name,email,role,level,position) VALUES(?,?,?,?,?,?,?)",
+                  (b.username, hash_pw(b.password), b.full_name, f"{b.username}@example.com", b.role, b.level, pos))
     except sqlite3.IntegrityError:
         raise HTTPException(400, "Tên đăng nhập đã tồn tại")
     log(c, u["id"], "TAO_TAI_KHOAN", None, ip_of(request), f"{b.username}/{b.role}")
@@ -260,17 +297,20 @@ def create_user(b: UserIn, request: Request, u=Depends(require("admin"))):
     return {"ok": True}
 
 
+# [M20] Phân quyền: đổi vai trò / khóa tài khoản (Admin)
 @app.put("/api/admin/users/{uid}")
 def edit_user(uid: int, b: UserEdit, request: Request, u=Depends(require("admin"))):
     if uid == u["id"] and (b.role != "admin" or not b.active):
         raise HTTPException(400, "Không thể tự hạ quyền hoặc khóa chính mình")
     c = db()
-    c.execute("UPDATE users SET role=?, level=?, active=? WHERE id=?", (b.role, b.level, int(b.active), uid))
+    c.execute("UPDATE users SET role=?, level=?, active=?, position=COALESCE(NULLIF(?, ''), position) WHERE id=?",
+              (b.role, b.level, int(b.active), b.position.strip(), uid))
     log(c, u["id"], "SUA_TAI_KHOAN", None, ip_of(request), f"user {uid} -> {b.role}/L{b.level}/active={b.active}")
     c.commit(); c.close()
     return {"ok": True}
 
 
+# [M15] Luồng ký: xem luồng mẫu
 @app.get("/api/templates")
 def templates(u=Depends(current_user)):
     c = db()
@@ -283,6 +323,7 @@ class TemplateIn(BaseModel):
     approver_ids: list[int]
 
 
+# [M15] Luồng ký: cấu hình luồng mẫu (Admin)
 @app.put("/api/admin/templates/{doc_type}")
 def set_template(doc_type: str, b: TemplateIn, request: Request, u=Depends(require("admin"))):
     c = db()
@@ -293,6 +334,7 @@ def set_template(doc_type: str, b: TemplateIn, request: Request, u=Depends(requi
     return {"ok": True}
 
 
+# [M21] Bảo mật: xem nhật ký và kiểm tra chuỗi hash (Admin)
 @app.get("/api/admin/audit")
 def audit(limit: int = 200, u=Depends(require("admin"))):
     c = db()
@@ -329,7 +371,7 @@ def get_doc(c, doc_id):
 
 
 def get_steps(c, doc_id):
-    return c.execute("""SELECT s.*, u.full_name FROM workflow_steps s JOIN users u ON u.id=s.approver_id
+    return c.execute("""SELECT s.*, u.full_name, u.position FROM workflow_steps s JOIN users u ON u.id=s.approver_id
                         WHERE doc_id=? ORDER BY step_order""", (doc_id,)).fetchall()
 
 
@@ -358,6 +400,7 @@ def doc_json(c, d, u, with_steps=False):
     return out
 
 
+# [M15] Văn bản: tạo mới / danh sách (có tính hash + mã hóa của M21)
 @app.post("/api/docs")
 async def create_doc(request: Request, title: str = Form(...), doc_type: str = Form(...),
                      confidential: str = Form("false"), approvers: str = Form(""),
@@ -387,6 +430,7 @@ async def create_doc(request: Request, title: str = Form(...), doc_type: str = F
     return {"id": doc_id, "sha256": h}
 
 
+# [M15] Văn bản: tạo mới / danh sách (có tính hash + mã hóa của M21)
 @app.get("/api/docs")
 def list_docs(scope: str = "mine", u=Depends(current_user)):
     c = db()
@@ -408,6 +452,7 @@ def list_docs(scope: str = "mine", u=Depends(current_user)):
     return out
 
 
+# [M15] Văn bản: chi tiết và tiến độ ký
 @app.get("/api/docs/{doc_id}")
 def doc_detail(doc_id: int, u=Depends(current_user)):
     c = db()
@@ -419,6 +464,7 @@ def doc_detail(doc_id: int, u=Depends(current_user)):
     return out
 
 
+# [M21] Toàn vẹn: xem file, so hash trước khi trả về
 @app.get("/api/docs/{doc_id}/file")
 def doc_file(doc_id: int, request: Request, u=Depends(current_user)):
     c = db()
@@ -434,6 +480,7 @@ def doc_file(doc_id: int, request: Request, u=Depends(current_user)):
     return Response(data, media_type=ctype)
 
 
+# [M21] Toàn vẹn: kiểm tra hash theo yêu cầu
 @app.get("/api/docs/{doc_id}/verify")
 def verify(doc_id: int, u=Depends(current_user)):
     c = db()
@@ -455,6 +502,7 @@ def owner_action(doc_id, u, allowed):
     return c, d
 
 
+# [M15] Luồng ký: gửi trình ký
 @app.post("/api/docs/{doc_id}/submit")
 def submit(doc_id: int, request: Request, u=Depends(current_user)):
     c, d = owner_action(doc_id, u, ("draft",))
@@ -469,6 +517,7 @@ def submit(doc_id: int, request: Request, u=Depends(current_user)):
     return {"ok": True}
 
 
+# [M15] Luồng ký: hủy văn bản
 @app.post("/api/docs/{doc_id}/cancel")
 def cancel(doc_id: int, request: Request, u=Depends(current_user)):
     c, d = owner_action(doc_id, u, ("draft", "pending"))
@@ -486,6 +535,7 @@ def approver_context(doc_id, u):
     return c, d
 
 
+# [M20] Xác thực nâng cao: cấp mã OTP để ký
 @app.post("/api/docs/{doc_id}/otp")
 def request_otp(doc_id: int, request: Request, u=Depends(current_user)):
     c, d = approver_context(doc_id, u)
@@ -501,9 +551,33 @@ def request_otp(doc_id: int, request: Request, u=Depends(current_user)):
 
 class SignIn(BaseModel):
     otp: str
+    password: str = ""
     comment: str = ""
 
 
+def PSS():
+    return padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH)
+
+
+def fingerprint(pub_pem: str) -> str:
+    return sha256(pub_pem.encode())[:16]
+
+
+# [M15] Chữ ký số RSA-2048: khóa riêng được mã hóa bằng mật khẩu người dùng, cần mật khẩu mới ký được
+def get_signing_key(c, user, password):
+    if not user["private_key_enc"]:  # lần ký đầu tiên: tạo cặp khóa
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        priv = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                 serialization.BestAvailableEncryption(password.encode())).decode()
+        pub = key.public_key().public_bytes(serialization.Encoding.PEM,
+                                            serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+        c.execute("UPDATE users SET public_key=?, private_key_enc=? WHERE id=?", (pub, priv, user["id"]))
+        return key, pub
+    key = serialization.load_pem_private_key(user["private_key_enc"].encode(), password=password.encode())
+    return key, user["public_key"]
+
+
+# [M15] Ký duyệt (kiểm tra [M21] hash + mật khẩu + [M20] OTP, rồi ký số lên hash của văn bản)
 @app.post("/api/docs/{doc_id}/sign")
 def sign(doc_id: int, b: SignIn, request: Request, u=Depends(current_user)):
     c, d = approver_context(doc_id, u)
@@ -513,15 +587,25 @@ def sign(doc_id: int, b: SignIn, request: Request, u=Depends(current_user)):
         log(c, u["id"], "LOI_TOAN_VEN", doc_id, ip, "chan ky vi hash khong khop")
         c.commit(); c.close()
         raise HTTPException(409, "CẢNH BÁO: file đã bị thay đổi, hệ thống từ chối cho ký")
+    if not check_pw(b.password, u["password"]):
+        log(c, u["id"], "KY_SAI_MAT_KHAU", doc_id, ip)
+        c.commit(); c.close()
+        raise HTTPException(400, "Mật khẩu xác nhận không đúng")
     o = c.execute("SELECT * FROM otps WHERE user_id=? AND doc_id=? AND used=0 ORDER BY id DESC LIMIT 1",
                   (u["id"], doc_id)).fetchone()
     if not o or o["expires"] < now() or not hmac.compare_digest(o["code_hash"], sha256(b.otp.strip().encode())):
         log(c, u["id"], "OTP_SAI", doc_id, ip)
         c.commit(); c.close()
         raise HTTPException(400, "Mã OTP sai hoặc đã hết hạn")
+    ts = now()
+    key, pub = get_signing_key(c, u, b.password)
+    payload = json.dumps({"doc_id": doc_id, "sha256": d["sha256"], "step": d["current_step"],
+                          "signer_id": u["id"], "time": ts}, sort_keys=True, separators=(",", ":"))
+    sig = base64.b64encode(key.sign(payload.encode(), PSS(), hashes.SHA256())).decode()
     c.execute("UPDATE otps SET used=1 WHERE id=?", (o["id"],))
-    c.execute("""UPDATE workflow_steps SET status='signed', signed_at=?, comment=?, hash_at_sign=?, method='OTP'
-                 WHERE doc_id=? AND step_order=?""", (now(), b.comment, d["sha256"], doc_id, d["current_step"]))
+    c.execute("""UPDATE workflow_steps SET status='signed', signed_at=?, comment=?, hash_at_sign=?, method=?,
+                 signature=?, sig_payload=?, key_fingerprint=? WHERE doc_id=? AND step_order=?""",
+              (ts, b.comment, d["sha256"], "OTP + Chữ ký số RSA", sig, payload, fingerprint(pub), doc_id, d["current_step"]))
     nxt = c.execute("SELECT approver_id FROM workflow_steps WHERE doc_id=? AND step_order=?",
                     (doc_id, d["current_step"] + 1)).fetchone()
     if nxt:
@@ -530,15 +614,48 @@ def sign(doc_id: int, b: SignIn, request: Request, u=Depends(current_user)):
     else:
         c.execute("UPDATE documents SET status='signed' WHERE id=?", (doc_id,))
         notify(c, d["owner_id"], doc_id, f"Văn bản '{d['title']}' đã được ký duyệt hoàn tất")
-    log(c, u["id"], "KY_DUYET", doc_id, ip, f"buoc {d['current_step']}; sha256={d['sha256']}")
+    log(c, u["id"], "KY_DUYET", doc_id, ip, f"buoc {d['current_step']}; sha256={d['sha256']}; khoa={fingerprint(pub)}")
     c.commit(); c.close()
     return {"ok": True, "completed": nxt is None}
+
+
+# [M15] Chữ ký số: kiểm tra lại từng chữ ký bằng khóa công khai của người ký
+@app.get("/api/docs/{doc_id}/signatures")
+def signatures(doc_id: int, u=Depends(current_user)):
+    c = db()
+    d = get_doc(c, doc_id)
+    if not can_view(c, d, u):
+        raise HTTPException(403, "Bạn không có quyền xem văn bản này")
+    file_ok, _ = read_verified(d)
+    out = []
+    for s in get_steps(c, doc_id):
+        if s["status"] != "signed":
+            continue
+        r = {"step": s["step_order"], "signer": s["full_name"], "signed_at": s["signed_at"],
+             "fingerprint": s["key_fingerprint"], "valid": False}
+        if not s["signature"]:
+            r["reason"] = "Bước này chỉ ký bằng OTP, không có chữ ký số"
+        else:
+            pem = c.execute("SELECT public_key FROM users WHERE id=?", (s["approver_id"],)).fetchone()["public_key"]
+            try:
+                serialization.load_pem_public_key(pem.encode()).verify(
+                    base64.b64decode(s["signature"]), s["sig_payload"].encode(), PSS(), hashes.SHA256())
+                if not file_ok or json.loads(s["sig_payload"])["sha256"] != d["sha256"]:
+                    r["reason"] = "Chữ ký đúng nhưng file đã bị thay đổi sau khi ký"
+                else:
+                    r["valid"] = True
+            except (InvalidSignature, ValueError, TypeError, AttributeError):
+                r["reason"] = "Chữ ký không hợp lệ"
+        out.append(r)
+    c.close()
+    return out
 
 
 class RejectIn(BaseModel):
     reason: str
 
 
+# [M15] Luồng ký: từ chối kèm lý do
 @app.post("/api/docs/{doc_id}/reject")
 def reject(doc_id: int, b: RejectIn, request: Request, u=Depends(current_user)):
     if not b.reason.strip():
@@ -553,6 +670,7 @@ def reject(doc_id: int, b: RejectIn, request: Request, u=Depends(current_user)):
     return {"ok": True}
 
 
+# [M15] Thông báo cho người duyệt
 @app.get("/api/notifications")
 def notifications(u=Depends(current_user)):
     c = db()
@@ -561,4 +679,214 @@ def notifications(u=Depends(current_user)):
     return [dict(r) for r in rows]
 
 
+# ---------------------------------------------------------------- Danh bạ & gửi file cho đồng nghiệp
+# [M20] Danh bạ: tên và chức vụ mọi người trong công ty
+@app.get("/api/directory")
+def directory(u=Depends(current_user)):
+    c = db()
+    rows = c.execute("SELECT id, full_name, position FROM users WHERE active=1 ORDER BY full_name COLLATE NOCASE").fetchall()
+    c.close()
+    return [dict(r, me=(r["id"] == u["id"])) for r in rows]
+
+
+# [M15] Gửi file: một file đến nhiều người ([M21] có hash, mã hóa AES nếu là tài liệu mật, ghi nhật ký)
+@app.post("/api/shares")
+async def send_share(request: Request, title: str = Form(...), message: str = Form(""), recipients: str = Form(...),
+                     confidential: str = Form("false"), file: UploadFile = File(...), u=Depends(current_user)):
+    if not title.strip():
+        raise HTTPException(400, "Cần nhập tiêu đề")
+    if os.path.splitext(file.filename)[1].lower() not in (".pdf", ".doc", ".docx"):
+        raise HTTPException(400, "Chỉ nhận file PDF hoặc Word")
+    data = await file.read()
+    if not data or len(data) > 10 * 1024 * 1024:
+        raise HTTPException(400, "File rỗng hoặc lớn hơn 10MB")
+    ids = sorted({int(x) for x in recipients.split(",") if x.strip().isdigit()} - {u["id"]})
+    if not ids or len(ids) > 200:
+        raise HTTPException(400, "Cần chọn từ 1 đến 200 người nhận (không tính chính bạn)")
+    c = db()
+    n = c.execute(f"SELECT COUNT(*) n FROM users WHERE active=1 AND id IN ({','.join('?' * len(ids))})", ids).fetchone()["n"]
+    if n != len(ids):
+        raise HTTPException(400, "Có người nhận không hợp lệ")
+    conf = confidential.lower() == "true"
+    h = sha256(data)
+    cur = c.execute("""INSERT INTO shares(sender_id,title,message,filename,stored_path,confidential,sha256,created_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (u["id"], title.strip(), message.strip(), file.filename, save_file(data, conf), int(conf), h, now()))
+    sid = cur.lastrowid
+    for i in ids:
+        c.execute("INSERT INTO share_recipients(share_id,user_id) VALUES(?,?)", (sid, i))
+        notify(c, i, None, f"{u['full_name']} đã gửi cho bạn file: {title.strip()}")
+    log(c, u["id"], "GUI_FILE", None, ip_of(request), f"share={sid}; nguoi nhan={ids}; sha256={h}; mat={conf}")
+    c.commit(); c.close()
+    return {"id": sid, "recipients": len(ids)}
+
+
+# [M15] Hộp thư: file đã nhận / đã gửi (người gửi thấy ai đã xem)
+@app.get("/api/shares")
+def list_shares(box: str = "inbox", u=Depends(current_user)):
+    c = db()
+    if box == "inbox":
+        rows = c.execute("""SELECT s.id, s.title, s.message, s.filename, s.confidential, s.created_at, r.read_at,
+                            us.full_name AS sender, us.position AS sender_position
+                            FROM shares s JOIN share_recipients r ON r.share_id=s.id JOIN users us ON us.id=s.sender_id
+                            WHERE r.user_id=? ORDER BY s.id DESC""", (u["id"],)).fetchall()
+        out = [dict(r, confidential=bool(r["confidential"])) for r in rows]
+    elif box == "sent":
+        out = []
+        for s in c.execute("""SELECT id,title,message,filename,confidential,created_at FROM shares
+                              WHERE sender_id=? ORDER BY id DESC""", (u["id"],)).fetchall():
+            rc = c.execute("""SELECT us.full_name, us.position, r.read_at FROM share_recipients r
+                              JOIN users us ON us.id=r.user_id WHERE r.share_id=? ORDER BY us.full_name""", (s["id"],)).fetchall()
+            out.append(dict(s, confidential=bool(s["confidential"]), recipients=[dict(x) for x in rc]))
+    else:
+        raise HTTPException(400, "box phải là inbox hoặc sent")
+    c.close()
+    return out
+
+
+# [M21] Xem file được gửi: so hash trước khi trả về; người nhận mở file thì đánh dấu "đã xem"
+@app.get("/api/shares/{sid}/file")
+def share_file(sid: int, request: Request, u=Depends(current_user)):
+    c = db()
+    s = c.execute("SELECT * FROM shares WHERE id=?", (sid,)).fetchone()
+    if not s:
+        raise HTTPException(404, "Không tìm thấy file")
+    is_rec = c.execute("SELECT 1 FROM share_recipients WHERE share_id=? AND user_id=?", (sid, u["id"])).fetchone()
+    if s["sender_id"] != u["id"] and not is_rec:
+        raise HTTPException(403, "Bạn không có quyền xem file này")
+    ok, data = read_verified(s)
+    log(c, u["id"], "XEM_FILE_GUI" if ok else "LOI_TOAN_VEN", None, ip_of(request), f"share={sid}")
+    if ok and is_rec:
+        c.execute("UPDATE share_recipients SET read_at=COALESCE(read_at, ?) WHERE share_id=? AND user_id=?", (now(), sid, u["id"]))
+    c.commit(); c.close()
+    if not ok:
+        raise HTTPException(409, "CẢNH BÁO: file đã bị thay đổi, hash không khớp với lúc gửi")
+    ctype = "application/pdf" if s["filename"].lower().endswith(".pdf") else "application/octet-stream"
+    return Response(data, media_type=ctype)
+
+
+# ---------------------------------------------------------------- [M21] Sao lưu & khôi phục (Admin)
+BK_NAME = re.compile(r"^backup-[0-9A-Za-z_-]+\.zip$")
+
+
+def make_backup(tag: str = "backup") -> str:
+    """Nén CSDL (ảnh chụp nhất quán) + file upload + manifest chứa hash từng file."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    name, n = f"{tag}-{stamp}.zip", 1
+    while os.path.exists(os.path.join(BACKUPS, name)):
+        n += 1
+        name = f"{tag}-{stamp}-{n}.zip"
+    snap = os.path.join(DATA, "snapshot.tmp")
+    src, dst = db(), sqlite3.connect(snap)
+    src.backup(dst)
+    src.close(); dst.close()
+    with open(snap, "rb") as f:
+        files = {"esign.db": f.read()}
+    os.remove(snap)
+    for f in sorted(os.listdir(UPLOADS)):
+        with open(os.path.join(UPLOADS, f), "rb") as fh:
+            files["uploads/" + f] = fh.read()
+    manifest = {"created_at": now(), "aes_key_sha256": sha256(AES_KEY), "files": {k: sha256(v) for k, v in files.items()}}
+    with zipfile.ZipFile(os.path.join(BACKUPS, name), "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("manifest.json", json.dumps(manifest, indent=1))
+        for k, v in files.items():
+            z.writestr(k, v)
+    return name
+
+
+def bk_path(name: str) -> str:
+    p = os.path.join(BACKUPS, name)
+    if not BK_NAME.match(name) or not os.path.exists(p):
+        raise HTTPException(404, "Không tìm thấy bản sao lưu")
+    return p
+
+
+def restore_backup(name: str) -> str:
+    """Kiểm tra hash từng file trong bản sao lưu, rồi mới ghi đè dữ liệu hiện tại. Trả về tên bản lưu an toàn."""
+    path, files = bk_path(name), {}
+    try:
+        with zipfile.ZipFile(path) as z:
+            manifest = json.loads(z.read("manifest.json"))
+            for k, h in manifest["files"].items():
+                if not (k == "esign.db" or (k.startswith("uploads/") and k[8:] and os.path.basename(k[8:]) == k[8:])):
+                    raise ValueError("tên file lạ: " + k)
+                data = z.read(k)
+                if sha256(data) != h:
+                    raise ValueError("file bị hỏng hoặc bị sửa: " + k)
+                files[k] = data
+    except Exception as e:
+        raise HTTPException(409, f"Bản sao lưu không hợp lệ ({e})")
+    if "esign.db" not in files:
+        raise HTTPException(409, "Bản sao lưu không có cơ sở dữ liệu")
+    if manifest.get("aes_key_sha256") != sha256(AES_KEY):
+        raise HTTPException(409, "Bản sao lưu thuộc hệ thống khác (khác khóa AES), không thể khôi phục")
+    snap = os.path.join(DATA, "restore.tmp")
+    with open(snap, "wb") as f:
+        f.write(files["esign.db"])
+    src = sqlite3.connect(snap)
+    try:
+        if src.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise HTTPException(409, "Cơ sở dữ liệu trong bản sao lưu bị hỏng")
+        safety = make_backup("backup-truoc-khoi-phuc")  # giữ lại trạng thái hiện tại phòng khi cần quay lại
+        dst = db()
+        src.backup(dst)
+        dst.close()
+    finally:
+        src.close()
+        os.remove(snap)
+    for f in os.listdir(UPLOADS):
+        os.remove(os.path.join(UPLOADS, f))
+    for k, v in files.items():
+        if k.startswith("uploads/"):
+            with open(os.path.join(UPLOADS, k[8:]), "wb") as fh:
+                fh.write(v)
+    init_db()
+    return safety
+
+
+# [M21] Sao lưu: danh sách / tạo / tải về / khôi phục (Admin)
+@app.get("/api/admin/backups")
+def list_backups(u=Depends(require("admin"))):
+    out = []
+    for f in os.listdir(BACKUPS):
+        if BK_NAME.match(f):
+            p = os.path.join(BACKUPS, f)
+            out.append({"name": f, "size": os.path.getsize(p),
+                        "created": datetime.fromtimestamp(os.path.getmtime(p), timezone.utc).strftime("%Y-%m-%d %H:%M:%S")})
+    return sorted(out, key=lambda x: x["created"], reverse=True)
+
+
+@app.post("/api/admin/backups")
+def create_backup(request: Request, u=Depends(require("admin"))):
+    c = db()
+    log(c, u["id"], "SAO_LUU", None, ip_of(request))
+    c.commit(); c.close()
+    name = make_backup()
+    return {"name": name, "size": os.path.getsize(os.path.join(BACKUPS, name))}
+
+
+@app.get("/api/admin/backups/{name}/download")
+def download_backup(name: str, request: Request, u=Depends(require("admin"))):
+    p = bk_path(name)
+    c = db()
+    log(c, u["id"], "TAI_BAN_SAO_LUU", None, ip_of(request), name)
+    c.commit(); c.close()
+    return FileResponse(p, media_type="application/zip", filename=name)
+
+
+@app.post("/api/admin/backups/{name}/restore")
+def restore(name: str, request: Request, u=Depends(require("admin"))):
+    safety = restore_backup(name)
+    c = db()
+    log(c, u["id"], "KHOI_PHUC", None, ip_of(request), f"tu {name}; ban an toan: {safety}")
+    chain = verify_chain(c)
+    c.commit(); c.close()
+    return {"ok": True, "safety_backup": safety, "chain_ok": chain}
+
+
 app.mount("/", StaticFiles(directory=os.path.join(BASE, "static"), html=True), name="static")
+
+
+if __name__ == "__main__":  # cho phép chạy bằng: python main.py
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
